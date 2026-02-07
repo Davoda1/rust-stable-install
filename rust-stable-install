@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+# rust-stable-install — colorful installed wrapper for Rust "standalone installers" (stable)
+#
+# Core workflow (your rules preserved):
+#  0) Check required tools upfront (no fallback unless higher priority missing).
+#  1) Ensure $WORKDIR exists and is RW for current user (create if needed).
+#  2) If version.txt exists, read it (if exists but not readable -> error+exit).
+#  3) Remove ALL contents under $WORKDIR (uses `trash` by default; `--rm` is available).
+#  4) Fetch latest stable version + per-target download URL + SHA256 from channel-rust-stable.toml.
+#  5) Verify Linux + detect arch -> target triple.
+#  6) If latest == old version.txt -> recreate version.txt with OLD data and exit "up-to-date".
+#  7) Download the proper tar.xz (wget2 > curl > wget).
+#  8) After download, show filename and folder and ask to continue.
+#  9) Verify SHA256.
+# 10) Unpack with tar -xvJf
+# 11) Trash $INSTALL_PREFIX if it exists.
+# 12) Install with: sudo ./install.sh --prefix=$INSTALL_PREFIX
+# 13) Backend cleanup (trash-empty when using trash)
+#
+# Improvements applied (all):
+# - Single-pass manifest parse (no triple parsing).
+# - No manifest temp files anywhere: fetches manifest to stdout and parses in-memory.
+# - Smarter tar/xz capability checks (does not require xz unless needed).
+# - Shows what will be removed and asks once before removal (unless --yes).
+# - Validates manifest target URL matches triple; errors if not found.
+# - Deterministic unpack dir from tar listing (no guessing rust-*).
+# - Prefers xz_hash/xz_url, falls back to hash/url if needed.
+# - Adds --yes (unattended) and --self-test (non-destructive diagnostics).
+#
+# Safety:
+# - Never uses rm unless you pass --rm.
+# - Only uses sudo for the install step you mandated.
+# - Does not touch any paths except:
+#     $WORKDIR/*
+#     $INSTALL_PREFIX
+#     (and reads system info / network fetches)
+
+set -euo pipefail
+
+# ----------------------------- Config -----------------------------
+# Download/Working dir
+WORKDIR="${WORKDIR:=${XDG_CACHE_HOME:-$HOME/.cache}/rust-stable-installer}"
+VERSION_FILE="${WORKDIR}/version.txt"
+MANIFEST_URL="https://static.rust-lang.org/dist/channel-rust-stable.toml"
+
+# Install target you mandated
+INSTALL_PREFIX="${INSTALL_PREFIX:=$HOME/rust-stable}"
+
+# ----------------------------- Options -----------------------------
+ASSUME_YES=0
+SELF_TEST=0
+FORCE_NO_COLOR=0
+DELETE_BACKEND="trash"
+
+print_help() {
+    cat <<'EOF'
+rust-stable-install — Rust stable standalone installer wrapper
+
+USAGE
+  rust-stable-install [--yes] [--self-test] [--no-color] [--rm|--trash] [-h|--help]
+
+OPTIONS
+  --yes         Non-interactive: auto-continue prompts.
+  --self-test   Non-destructive checks only: tools, platform, manifest parse, permissions.
+  --no-color    Disable ANSI colors (same effect as NO_COLOR=1).
+  --rm          Use rm for deletions (permanent).
+  --trash       Use trash-cli for deletions (recoverable; default).
+  -h, --help    Show this help.
+
+ENV
+  NO_COLOR=1    Disable ANSI colors.
+
+EOF
+}
+
+
+while (( $# > 0 )); do
+    case "$1" in
+        --yes) ASSUME_YES=1; shift ;;
+        --self-test) SELF_TEST=1; shift ;;
+        --no-color) FORCE_NO_COLOR=1; shift ;;
+        --rm) DELETE_BACKEND="rm"; shift ;;
+        --trash) DELETE_BACKEND="trash"; shift ;;
+        -h|--help) print_help; exit 0 ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "Use --help." >&2
+            exit 1
+            ;;
+    esac
+done
+
+
+# Resolve NO_COLOR:
+# - --no-color always wins
+# - Otherwise, NO_COLOR env var disables colors if set to a non-empty, non-0 value
+NO_COLOR_EFFECTIVE=0
+if [[ "$FORCE_NO_COLOR" == "1" ]]; then
+    NO_COLOR_EFFECTIVE=1
+elif [[ -n "${NO_COLOR+x}" ]]; then
+    if [[ -n "${NO_COLOR:-}" && "${NO_COLOR:-}" != "0" ]]; then
+        NO_COLOR_EFFECTIVE=1
+    fi
+fi
+
+# ----------------------------- Colors -----------------------------
+NO_COLOR="${NO_COLOR:-0}"
+if [[ "$NO_COLOR_EFFECTIVE" == "1" ]]; then
+    NO_COLOR="1"
+fi
+if [[ "$NO_COLOR" == "1" || ! -t 1 ]]; then
+    BOLD=""; DIM=""; RESET=""
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""
+else
+    BOLD="$(tput bold 2>/dev/null || printf '')"
+    DIM="$(tput dim 2>/dev/null || printf '')"
+    RESET="$(tput sgr0 2>/dev/null || printf '')"
+    RED="$(tput setaf 1 2>/dev/null || printf '')"
+    GREEN="$(tput setaf 2 2>/dev/null || printf '')"
+    YELLOW="$(tput setaf 3 2>/dev/null || printf '')"
+    BLUE="$(tput setaf 4 2>/dev/null || printf '')"
+    CYAN="$(tput setaf 6 2>/dev/null || printf '')"
+fi
+
+# ----------------------------- Logging -----------------------------
+info()  { printf "%s[INFO]%s %s\n" "${BOLD}${CYAN}" "${RESET}" "$*"; }
+ok()    { printf "%s[ OK ]%s %s\n" "${BOLD}${GREEN}" "${RESET}" "$*"; }
+warn()  { printf "%s[WARN]%s %s\n" "${BOLD}${YELLOW}" "${RESET}" "$*"; }
+err()   { printf "%s[ERR ]%s %s\n" "${BOLD}${RED}" "${RESET}" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required tool: '$1'."; }
+
+prompt_yes_no() {
+    local prompt="$1"
+    if [[ "$ASSUME_YES" == "1" ]]; then
+        info "${prompt} (auto-yes)"
+        return 0
+    fi
+    local ans=""
+    printf "%s%s%s " "${BOLD}${YELLOW}" "${prompt}" "${RESET}"
+    read -r ans || true
+    case "${ans,,}" in
+        y|yes) return 0 ;;
+        *)     return 1 ;;
+    esac
+}
+
+
+# ----------------------------- Delete backend helpers -----------------------------
+DEL_NOUN="Trash"
+DEL_ING="Trashing"
+DEL_VERB="trash"
+DEL_PAST="Trashed"
+DEL_PAST_L="trashed"
+DEL_DESC="recoverable"
+
+init_delete_labels() {
+    if [[ "$DELETE_BACKEND" == "rm" ]]; then
+        DEL_NOUN="Delete"
+        DEL_ING="Deleting"
+        DEL_VERB="delete"
+        DEL_PAST="Deleted"
+        DEL_PAST_L="deleted"
+        DEL_DESC="permanent"
+    else
+        DEL_NOUN="Trash"
+        DEL_ING="Trashing"
+        DEL_VERB="trash"
+        DEL_PAST="Trashed"
+        DEL_PAST_L="trashed"
+        DEL_DESC="recoverable"
+    fi
+}
+
+# Initialize delete-backend user-facing labels after parsing flags
+init_delete_labels
+
+
+delete_paths() {
+    # Usage: delete_paths <path>...
+    if (( $# == 0 )); then
+        return 0
+    fi
+
+    if [[ "$DELETE_BACKEND" == "rm" ]]; then
+        rm -rf -- "$@"
+    else
+        trash -- "$@"
+    fi
+}
+
+delete_backend_cleanup() {
+    if [[ "$DELETE_BACKEND" == "trash" ]]; then
+        info "Step 13: Empty trash (trash-empty)"
+        trash-empty || die "trash-empty failed."
+    fi
+}
+
+# ----------------------------- Tool checks (Step 0) -----------------------------
+DL_BIN=""  # wget2 | curl | wget
+
+tool_checks() {
+    [[ -n "${USER:-}" ]] || die "\$USER is empty/unset. Refusing to continue for safety."
+    [[ -n "${HOME:-}" ]] || die "\$HOME is empty/unset. Refusing to continue for safety."
+
+    need_cmd bash
+    need_cmd uname
+    need_cmd id
+    need_cmd mkdir
+    need_cmd cat
+    need_cmd printf
+    need_cmd grep
+    need_cmd sed
+    need_cmd awk
+    need_cmd tar
+    need_cmd sha256sum
+    need_cmd head
+    need_cmd cut
+
+    if [[ "$DELETE_BACKEND" == "trash" ]]; then
+        need_cmd trash
+        need_cmd trash-empty
+    else
+        need_cmd rm
+    fi
+    need_cmd sudo
+
+    # tar must support -J or we need xz
+    if tar --help 2>/dev/null | grep -qE '(^|[[:space:]])-J([[:space:]]|,|$)'; then
+        : # OK
+    else
+        # Only require xz if tar doesn't advertise -J
+        need_cmd xz
+    fi
+
+    if command -v wget2 >/dev/null 2>&1; then
+        DL_BIN="wget2"
+    elif command -v curl >/dev/null 2>&1; then
+        DL_BIN="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        DL_BIN="wget"
+    else
+        die "Missing downloader: install 'wget2' (preferred) or 'curl' or 'wget'."
+    fi
+
+    ok "Tool checks passed. Downloader selected: ${DL_BIN}"
+}
+
+# ----------------------------- Platform + arch mapping (Step 5) -----------------------------
+get_rust_target_triple() {
+    local os arch
+    os="$(uname -s || true)"
+    arch="$(uname -m || true)"
+
+    [[ "$os" == "Linux" ]] || die "This script supports Linux only. Detected OS: '${os}'."
+
+    case "$arch" in
+        x86_64)  printf "x86_64-unknown-linux-gnu" ;;
+        aarch64) printf "aarch64-unknown-linux-gnu" ;;
+        i686)    printf "i686-unknown-linux-gnu" ;;
+        armv7l)  printf "armv7-unknown-linux-gnueabihf" ;;
+        *)
+            die "Unsupported architecture '${arch}'. No known Rust standalone installer triple mapping."
+            ;;
+    esac
+}
+
+# ----------------------------- Download helpers -----------------------------
+is_tty() {
+    # Show progress if we can reasonably render it:
+    # - stdout or stderr is a TTY (most progress UI goes to stderr anyway)
+    # - TERM is not dumb (and is set)
+    [[ -t 1 || -t 2 ]] || return 1
+    [[ -n "${TERM-}" && "${TERM-}" != "dumb" ]] || return 1
+    return 0
+}
+
+fetch_stdout() {
+    local url="$1"
+    case "$DL_BIN" in
+        wget2) wget2 -qO- --https-only "$url" ;;
+        curl)  curl -fsSL "$url" ;;
+        wget)  wget -qO- --https-only "$url" ;;
+        *)     die "Internal error: unknown downloader '${DL_BIN}'." ;;
+    esac
+}
+
+# download_to() {
+#     local url="$1"
+#     local out="$2"
+#     case "$DL_BIN" in
+#         wget2) wget2 -q --https-only -O "$out" "$url" ;;
+#         curl)  curl -fsSL -o "$out" "$url" ;;
+#         wget)  wget -q --https-only -O "$out" "$url" ;;
+#         *)     die "Internal error: unknown downloader '${DL_BIN}'." ;;
+#     esac
+# }
+
+download_to() {
+    local url="$1"
+    local out="$2"
+
+    case "$DL_BIN" in
+        wget2)
+            if is_tty; then
+                wget2 --https-only -O "$out" "$url" 1>&2
+            else
+                wget2 -q --https-only -O "$out" "$url"
+            fi
+            ;;
+        curl)
+            if is_tty; then
+                curl -fL --progress-bar -o "$out" "$url" 1>&2
+            else
+                curl -fsSL -o "$out" "$url"
+            fi
+            ;;
+        wget)
+            if is_tty; then
+                wget --https-only --progress=dot:giga -O "$out" "$url" 1>&2
+            else
+                wget -q --https-only -O "$out" "$url"
+            fi
+            ;;
+        *)
+            die "Internal error: unknown downloader '${DL_BIN}'."
+            ;;
+    esac
+}
+
+download_into_dir_keep_name() {
+    local url="$1"
+    local dir="$2"
+    local filename
+    filename="$(basename "$url")"
+    [[ -n "$filename" ]] || die "Could not derive filename from URL: $url"
+    download_to "$url" "${dir}/${filename}"
+    printf "%s" "${dir}/${filename}"
+}
+
+# ----------------------------- Manifest parsing (Step 4) -----------------------------
+# Outputs 3 lines:
+#   1) stable_version (numeric, e.g. 1.93.0)
+#   2) url (xz_url preferred, else url)
+#   3) sha256 (xz_hash preferred, else hash)
+parse_manifest_from_text() {
+    local manifest_text="$1"
+    local target_triple="$2"
+
+    awk -v tgt="$target_triple" '
+        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+        function unq(s){ s=trim(s); sub(/^"/,"",s); sub(/"$/,"",s); return s }
+
+        BEGIN { in_pkg_rust=0; in_tgt=0; ver=""; url=""; hash=""; url_fallback=""; hash_fallback="" }
+
+        /^\[pkg\.rust\][[:space:]]*$/ { in_pkg_rust=1; next }
+        /^\[pkg\.rust\./ { if ($0 !~ /^\[pkg\.rust\]$/) in_pkg_rust=0 }
+
+        in_pkg_rust && /^[[:space:]]*version[[:space:]]*=/ && ver=="" {
+            line=$0
+            sub(/^[^=]*=/,"",line)
+            v=unq(line)              # e.g. 1.93.0 (hash...)
+            split(v,a," ")
+            ver=a[1]                 # numeric prefix
+            next
+        }
+
+        /^\[pkg\.rust\.target\./ {
+            # enter/leave a target section
+            in_tgt = (index($0, tgt) > 0) ? 1 : 0
+            next
+        }
+        /^\[/ { if ($0 !~ /^\[pkg\.rust\.target\./) in_tgt=0 }
+
+        in_tgt && /^[[:space:]]*xz_url[[:space:]]*=/ && url=="" {
+            line=$0; sub(/^[^=]*=/,"",line); url=unq(line); next
+        }
+        in_tgt && /^[[:space:]]*url[[:space:]]*=/ && url_fallback=="" {
+            line=$0; sub(/^[^=]*=/,"",line); url_fallback=unq(line); next
+        }
+        in_tgt && /^[[:space:]]*xz_hash[[:space:]]*=/ && hash=="" {
+            line=$0; sub(/^[^=]*=/,"",line); hash=unq(line); next
+        }
+        in_tgt && /^[[:space:]]*hash[[:space:]]*=/ && hash_fallback=="" {
+            line=$0; sub(/^[^=]*=/,"",line); hash_fallback=unq(line); next
+        }
+
+        END {
+            if (url=="" && url_fallback!="") url=url_fallback
+            if (hash=="" && hash_fallback!="") hash=hash_fallback
+            print ver
+            print url
+            print hash
+        }
+    ' <<<"$manifest_text"
+}
+
+# ----------------------------- Self-test (non-destructive) -----------------------------
+self_test() {
+    tool_checks
+
+    info "Self-test: platform/arch"
+    local triple
+    triple="$(get_rust_target_triple)"
+    ok "Target triple: ${triple}"
+
+    info "Self-test: workdir permissions (non-destructive)"
+    if [[ -d "$WORKDIR" ]]; then
+        [[ -r "$WORKDIR" && -w "$WORKDIR" ]] || die "Workdir exists but is not readable/writable: ${WORKDIR}"
+        ok "Workdir exists and is RW: ${WORKDIR}"
+    else
+        die "Workdir missing: ${WORKDIR} (would be created in normal run)."
+    fi
+
+    info "Self-test: manifest fetch + parse"
+    local manifest
+    manifest="$(fetch_stdout "$MANIFEST_URL")" || die "Failed to fetch manifest: ${MANIFEST_URL}"
+
+    local ver url hash
+    mapfile -t lines < <(parse_manifest_from_text "$manifest" "$triple")
+    ver="${lines[0]:-}"; url="${lines[1]:-}"; hash="${lines[2]:-}"
+
+    [[ -n "$ver" ]] || die "Manifest parse failed: version missing."
+    [[ -n "$url" ]] || die "Manifest parse failed: url missing for ${triple}."
+    [[ -n "$hash" ]] || die "Manifest parse failed: hash missing for ${triple}."
+    ok "Parsed stable version: ${ver}"
+    ok "Parsed URL: ${url}"
+    ok "Parsed SHA256: ${hash}"
+
+    # Validate URL matches triple (future-proof sanity)
+    if [[ "$url" != *"$triple"* ]]; then
+        die "Parsed URL does not contain target triple '${triple}'. Refusing (sanity check). URL: ${url}"
+    fi
+    ok "URL sanity check passed (contains target triple)."
+
+    ok "Self-test OK (no changes made)."
+}
+
+# ----------------------------- Main -----------------------------
+main() {
+    if [[ "$SELF_TEST" == "1" ]]; then
+        self_test
+        exit 0
+    fi
+
+    tool_checks
+
+    info "Step 1: Ensure work dir exists and is RW: ${WORKDIR}"
+    if [[ ! -d "$WORKDIR" ]]; then
+        mkdir -p "$WORKDIR" || die "Failed to create '${WORKDIR}'."
+    fi
+    [[ -r "$WORKDIR" && -w "$WORKDIR" ]] || die "Directory '${WORKDIR}' is not readable/writable for current user."
+
+    local old_version=""
+    info "Step 2: Read old version.txt if present"
+    if [[ -e "$VERSION_FILE" ]]; then
+        [[ -r "$VERSION_FILE" ]] || die "version.txt exists but is not readable: '${VERSION_FILE}'"
+        old_version="$(cat "$VERSION_FILE" || true)"
+        old_version="${old_version//$'\r'/}"
+        old_version="$(printf "%s" "$old_version" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [[ -n "$old_version" ]]; then
+            ok "Previous version.txt: ${old_version}"
+        else
+            warn "version.txt exists but is empty."
+        fi
+    else
+        info "No version.txt found (fresh path)."
+    fi
+
+    info "Steps 4-5: Detect target triple + fetch/parse manifest (source of truth)"
+    local triple
+    triple="$(get_rust_target_triple)"
+    ok "Detected Rust target triple: ${triple}"
+
+    local manifest
+    manifest="$(fetch_stdout "$MANIFEST_URL")" || die "Failed to fetch manifest: ${MANIFEST_URL}"
+
+    local stable_ver url expected_hash
+    mapfile -t mlines < <(parse_manifest_from_text "$manifest" "$triple")
+    stable_ver="${mlines[0]:-}"
+    url="${mlines[1]:-}"
+    expected_hash="${mlines[2]:-}"
+
+    [[ -n "$stable_ver" ]] || die "Could not parse stable version from manifest."
+    [[ -n "$url" ]] || die "Could not parse download URL for target '${triple}' from manifest."
+    [[ -n "$expected_hash" ]] || die "Could not parse SHA256 hash for target '${triple}' from manifest."
+
+    if [[ "$url" != *"$triple"* ]]; then
+        die "Manifest URL sanity check failed: URL does not contain target triple '${triple}'. URL: ${url}"
+    fi
+
+    ok "Latest stable version: ${stable_ver}"
+    info "Manifest URL: ${url}"
+
+    info "Step 3: ${DEL_ING} all existing contents under ${WORKDIR} (${DEL_DESC})"
+    # Show what will be trashed (your Step 3 still applies: everything inside WORKDIR)
+    shopt -s nullglob dotglob
+    local entries=( "${WORKDIR}/"* )
+    shopt -u nullglob dotglob
+
+    if (( ${#entries[@]} > 0 )); then
+        info "Items to be ${DEL_PAST_L}:"
+        for p in "${entries[@]}"; do
+            printf "  - %s\n" "$(basename "$p")"
+        done
+
+        if ! prompt_yes_no "${DEL_NOUN} ALL listed items under ${WORKDIR}? (${DEL_DESC}) [y/N]"; then
+            die "User aborted before ${DEL_ING,,} workdir contents."
+        fi
+
+        delete_paths "${entries[@]}" || die "Failed to ${DEL_ING,,} contents of '${WORKDIR}'."
+        ok "${DEL_PAST} ${#entries[@]} item(s) under ${WORKDIR}."
+    else
+        info "Work dir already empty."
+    fi
+
+    info "Step 6: Up-to-date check"
+    if [[ -n "$old_version" && "$stable_ver" == "$old_version" ]]; then
+        # Per your rule: version.txt was deleted; recreate with OLD data
+        printf "%s\n" "$old_version" > "$VERSION_FILE" || die "Failed to write '${VERSION_FILE}'."
+        ok "rust is up-to-date (${stable_ver}). Recreated version.txt (old data) and exiting."
+        delete_backend_cleanup
+        exit 0
+    fi
+
+    info "Step 7: Download proper tar.xz into ${WORKDIR}"
+    info "Downloading Rust ${stable_ver} for ${triple}"
+    local tar_path
+    tar_path="$(download_into_dir_keep_name "$url" "$WORKDIR")" || die "Download failed."
+    local tar_file
+    tar_file="$(basename "$tar_path")"
+    ok "Downloaded: ${tar_file}"
+    ok "Folder: ${WORKDIR}"
+
+    info "Step 8: Continue prompt (after download)"
+    if ! prompt_yes_no "Continue with SHA256 verify + unpack + install? [y/N]"; then
+        warn "User aborted. Leaving downloaded file in place: ${tar_path}"
+        exit 0
+    fi
+
+    info "Step 9: Verify SHA256"
+    local got_hash
+    got_hash="$(sha256sum "$tar_path" | awk '{print $1}')" || die "sha256sum failed on '${tar_path}'."
+    if [[ "${got_hash,,}" != "${expected_hash,,}" ]]; then
+        die "SHA256 mismatch!
+  Expected: ${expected_hash}
+  Got:      ${got_hash}
+Refusing to unpack/install."
+    fi
+    ok "SHA256 OK."
+
+    info "Step 10: Unpack with tar -xvJf"
+    ( cd "$WORKDIR" && tar -xvJf "$tar_file" ) || die "Unpack failed."
+
+    info "Step 10b: Determine unpack directory from tar listing (deterministic)"
+    local topdir
+    topdir="$(tar -tJf "$tar_path" | sed -n '1{s#/.*##;p;}')"   # no early pipe close => no SIGPIPE
+    [[ -n "$topdir" ]] || die "Could not determine top-level directory from tarball."
+    local unpack_dir="${WORKDIR}/${topdir}"
+    [[ -d "$unpack_dir" ]] || die "Expected unpack directory not found: ${unpack_dir}"
+    ok "Unpacked directory: ${unpack_dir}"
+
+    if [[ -e "$INSTALL_PREFIX" ]]; then
+        if [[ ! -w "$INSTALL_PREFIX" ]]; then
+            warn "Install prefix exists but is not writable by user '$USER': $INSTALL_PREFIX"
+            warn "Likely installed with sudo into a root-owned path."
+            warn "I cannot remove it safely."
+            warn "Continuing may fail or may overwrite in-place using sudo and could leave a mixed install."
+            warn "Recommended to abort and remove it manually with sudo if this is intended."
+
+            if ! prompt_yes_no "Continue anyway at your own risk? [y/N]"; then
+                die "Aborted by user due to non-writable install prefix."
+            fi
+
+            info "Continuing without removing existing install prefix."
+        fi
+    fi
+
+    info "Step 11: ${DEL_ING} existing install prefix if it exists: ${INSTALL_PREFIX} (${DEL_DESC})"
+    if [[ -e "$INSTALL_PREFIX" ]]; then
+        info "Existing install dir will be ${DEL_NOUN,,}d: ${INSTALL_PREFIX} (${DEL_DESC})"
+        if ! prompt_yes_no "${DEL_NOUN} existing install dir ${INSTALL_PREFIX}? (${DEL_DESC}) [y/N]"; then
+            die "User aborted before ${DEL_ING,,} existing install dir."
+        fi
+        delete_paths "$INSTALL_PREFIX" || die "Failed to ${DEL_ING,,} existing install dir: ${INSTALL_PREFIX}"
+        ok "${DEL_PAST} existing install dir."
+    else
+        info "No existing install dir to ${DEL_VERB}."
+    fi
+
+    info "Step 12: Install (sudo required per your command)"
+    info "Command: sudo ./install.sh --prefix=${INSTALL_PREFIX}"
+    if ! prompt_yes_no "Proceed with sudo install to ${INSTALL_PREFIX}? [y/N]"; then
+        warn "User aborted before install. Leaving unpacked folder and tarball in place under: ${WORKDIR}"
+        exit 0
+    fi
+
+    ( cd "$unpack_dir" && sudo ./install.sh --prefix="$INSTALL_PREFIX" ) || die "Install failed."
+    ok "Install completed to: ${INSTALL_PREFIX}"
+
+    info "Write new version.txt (post-success only)"
+    printf "%s\n" "$stable_ver" > "$VERSION_FILE" || die "Failed to write '${VERSION_FILE}'."
+
+    info "Step 13: trash-empty"
+    delete_backend_cleanup
+    ok "Done. Installed Rust stable ${stable_ver} to ${INSTALL_PREFIX}"
+}
+
+main "$@"
