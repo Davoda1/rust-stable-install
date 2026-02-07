@@ -447,6 +447,7 @@ main() {
 
     tool_checks
 
+    info "Deletion backend: ${DELETE_BACKEND} (${DEL_DESC})"
     info "Step 1: Ensure work dir exists and is RW: ${WORKDIR}"
     if [[ ! -d "$WORKDIR" ]]; then
         mkdir -p "$WORKDIR" || die "Failed to create '${WORKDIR}'."
