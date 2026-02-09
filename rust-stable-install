@@ -36,6 +36,15 @@
 #     (and reads system info / network fetches)
 
 set -euo pipefail
+# ---- placeholders (safe defaults) ----
+BOLD=""
+DIM=""
+RESET=""
+RED=""
+GREEN=""
+YELLOW=""
+BLUE=""
+CYAN=""
 
 # ----------------------------- Config -----------------------------
 # Download/Working dir
@@ -51,25 +60,28 @@ ASSUME_YES=0
 SELF_TEST=0
 FORCE_NO_COLOR=0
 SKIP_PREFIX_DELETE=0
+CHECK_ONLY=0
 DELETE_BACKEND="trash"
+PRINT_HELP_VAR=0
 
 print_help() {
-    cat <<'EOF'
-rust-stable-install — Rust stable standalone installer wrapper
+    cat <<EOF
+${BOLD}rust-stable-install${RESET} — ${DIM}Rust stable standalone installer wrapper${RESET}
 
-USAGE
-  rust-stable-install [--yes] [--self-test] [--no-color] [--rm|--trash] [-h|--help]
+${BOLD}USAGE${RESET}
+  ${YELLOW}rust-stable-install${RESET} [${DIM}--yes${RESET}] [${DIM}--self-test${RESET}] [${DIM}--check${RESET}] [${DIM}--no-color${RESET}] [${DIM}--rm${RESET}|${DIM}--trash${RESET}] [${DIM}-h${RESET}|${DIM}--help${RESET}]
 
-OPTIONS
-  --yes         Non-interactive: auto-continue prompts.
-  --self-test   Non-destructive checks only: tools, platform, manifest parse, permissions.
-  --no-color    Disable ANSI colors (same effect as NO_COLOR=1).
-  --rm          Use rm for deletions (permanent).
-  --trash       Use trash-cli for deletions (recoverable; default).
-  -h, --help    Show this help.
+${BOLD}OPTIONS${RESET}
+  ${BOLD}${BLUE}--yes${RESET}         ${DIM}Non-interactive: auto-continue prompts.${RESET}
+  ${BOLD}${BLUE}--self-test${RESET}   ${DIM}Non-destructive checks only: tools, platform, manifest parse, permissions.${RESET}
+  ${BOLD}${BLUE}--check${RESET}       ${DIM}Check only: compare installed version.txt with latest stable (no install).${RESET}
+  ${BOLD}${BLUE}--no-color${RESET}    ${DIM}Disable ANSI colors (same effect as NO_COLOR=1).${RESET}
+  ${BOLD}${BLUE}--rm${RESET}          ${DIM}Use rm for deletions (permanent).${RESET}
+  ${BOLD}${BLUE}--trash${RESET}       ${DIM}Use trash-cli for deletions (recoverable; default).${RESET}
+  ${BOLD}${BLUE}-h${RESET}, ${BOLD}${BLUE}--help${RESET}    ${DIM}Show this help.${RESET}
 
-ENV
-  NO_COLOR=1    Disable ANSI colors.
+${BOLD}ENV${RESET}
+  ${BOLD}${BLUE}NO_COLOR${RESET}=${BOLD}${BLUE}1${RESET}    ${DIM}Disable ANSI colors.${RESET}
 
 EOF
 }
@@ -79,10 +91,11 @@ while (( $# > 0 )); do
     case "$1" in
         --yes) ASSUME_YES=1; shift ;;
         --self-test) SELF_TEST=1; shift ;;
+        --check) CHECK_ONLY=1; shift ;;
         --no-color) FORCE_NO_COLOR=1; shift ;;
         --rm) DELETE_BACKEND="rm"; shift ;;
         --trash) DELETE_BACKEND="trash"; shift ;;
-        -h|--help) print_help; exit 0 ;;
+        -h|--help) PRINT_HELP_VAR=1; shift ;;
         *)
             echo "Unknown argument: $1" >&2
             echo "Use --help." >&2
@@ -121,6 +134,12 @@ else
     YELLOW="$(tput setaf 3 2>/dev/null || printf '')"
     BLUE="$(tput setaf 4 2>/dev/null || printf '')"
     CYAN="$(tput setaf 6 2>/dev/null || printf '')"
+fi
+
+# ----------------------------- Runs help -----------------------------
+if [[ "$PRINT_HELP_VAR" == "1" ]]; then
+    print_help
+    exit 0
 fi
 
 # ----------------------------- Logging -----------------------------
@@ -396,6 +415,32 @@ parse_manifest_from_text() {
         }
     ' <<<"$manifest_text"
 }
+# Parse only the stable Rust version from channel manifest text (no target needed).
+# Prints the numeric version (e.g. "1.93.0") or empty on failure.
+parse_stable_version_only() {
+    local manifest_text="$1"
+
+    awk '
+        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+        function unq(s){ s=trim(s); sub(/^"/,"",s); sub(/"$/,"",s); return s }
+
+        BEGIN { in_pkg_rust=0; ver="" }
+
+        /^\[pkg\.rust\][[:space:]]*$/ { in_pkg_rust=1; next }
+        /^\[pkg\.rust\./ { if ($0 !~ /^\[pkg\.rust\]$/) in_pkg_rust=0 }
+
+        in_pkg_rust && /^[[:space:]]*version[[:space:]]*=/ && ver=="" {
+            line=$0
+            sub(/^[^=]*=/,"",line)
+            v=unq(line)
+            split(v,a," ")
+            ver=a[1]
+        }
+
+        END { print ver }
+    ' <<<"$manifest_text"
+}
+
 
 # ----------------------------- Self-test (non-destructive) -----------------------------
 self_test() {
@@ -404,6 +449,7 @@ self_test() {
     info "Self-test: platform/arch"
     local triple
     triple="$(get_rust_target_triple)"
+    info "Detected target: ${triple}"
     ok "Target triple: ${triple}"
 
     info "Self-test: workdir permissions (non-destructive)"
@@ -439,9 +485,83 @@ self_test() {
 }
 
 # ----------------------------- Main -----------------------------
+
+# ----------------------------- Minimal tool checks for --check -----------------------------
+tool_checks_check() {
+    [[ -n "${USER:-}" ]] || die "\$USER is empty/unset. Refusing to continue for safety."
+    [[ -n "${HOME:-}" ]] || die "\$HOME is empty/unset. Refusing to continue for safety."
+
+    # Keep this intentionally minimal: --check should not require tar/sudo/etc.
+    need_cmd bash
+    need_cmd uname
+    need_cmd cat
+    need_cmd printf
+    need_cmd grep
+    need_cmd sed
+    need_cmd awk
+    need_cmd head
+    need_cmd cut
+
+    if command -v wget2 >/dev/null 2>&1; then
+        DL_BIN="wget2"
+    elif command -v curl >/dev/null 2>&1; then
+        DL_BIN="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        DL_BIN="wget"
+    else
+        die "Missing downloader: install 'wget2' (preferred) or 'curl' or 'wget'."
+    fi
+
+    ok "Tool checks passed (check-only). Downloader selected: ${DL_BIN}"
+}
+
+# ----------------------------- Check-only mode -----------------------------
+check_only() {
+    tool_checks_check
+
+    local triple
+    triple="$(get_rust_target_triple)"
+    info "Detected target: ${triple}"
+
+    local installed_ver=""
+    if [[ -e "$VERSION_FILE" ]]; then
+        [[ -r "$VERSION_FILE" ]] || die "Version file exists but is not readable: ${VERSION_FILE}"
+        installed_ver="$(head -n 1 "$VERSION_FILE" | sed 's/\r$//')"
+    fi
+
+    info "Check: fetch latest stable manifest"
+    local manifest stable_ver
+    manifest="$(fetch_stdout "$MANIFEST_URL")" || die "Failed to fetch manifest: ${MANIFEST_URL}"
+
+    stable_ver="$(parse_stable_version_only "$manifest")"
+    [[ -n "$stable_ver" ]] || die "Manifest parse failed: stable version missing."
+
+    if [[ -z "$installed_ver" ]]; then
+        warn "No installed version found (missing/empty): ${VERSION_FILE}"
+        ok "Latest stable available: ${stable_ver}"
+        return 0
+    fi
+
+    info "Installed: ${installed_ver}"
+    info "Latest:    ${stable_ver}"
+
+    if [[ "$installed_ver" == "$stable_ver" ]]; then
+        ok "Up-to-date: Rust stable ${stable_ver}"
+    else
+        warn "Update available: ${installed_ver} -> ${stable_ver}"
+    fi
+
+    return 0
+}
+
 main() {
     if [[ "$SELF_TEST" == "1" ]]; then
         self_test
+        exit 0
+    fi
+
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        check_only
         exit 0
     fi
 
@@ -473,6 +593,7 @@ main() {
     info "Steps 4-5: Detect target triple + fetch/parse manifest (source of truth)"
     local triple
     triple="$(get_rust_target_triple)"
+    info "Detected target: ${triple}"
     ok "Detected Rust target triple: ${triple}"
 
     local manifest
