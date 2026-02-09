@@ -80,6 +80,21 @@ ${BOLD}OPTIONS${RESET}
   ${BOLD}${BLUE}--trash${RESET}       ${DIM}Use trash-cli for deletions (recoverable; default).${RESET}
   ${BOLD}${BLUE}-h${RESET}, ${BOLD}${BLUE}--help${RESET}    ${DIM}Show this help.${RESET}
 
+${BOLD}What it does:${RESET}
+  • Verifies required tools and platform safety (Linux only)
+  • Detects system architecture and resolves the Rust target triple
+  • Reads the installed Rust version from ${VERSION_FILE} (if present)
+  • Fetches and parses the official Rust stable manifest (in-memory)
+  • Compares installed vs latest stable version
+  • If up-to-date: exits cleanly without changes
+  • If newer:
+      – Cleans the working directory using trash or rm (per flag)
+      – Downloads the correct Rust standalone tarball
+      – Verifies SHA256 integrity
+      – Unpacks deterministically
+      – Installs to the configured prefix using sudo
+  • Writes the new version back to version.txt on success
+
 ${BOLD}ENV${RESET}
   ${BOLD}${BLUE}NO_COLOR${RESET}=${BOLD}${BLUE}1${RESET}    ${DIM}Disable ANSI colors.${RESET}
 
