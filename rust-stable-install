@@ -72,32 +72,29 @@ ${BOLD}USAGE${RESET}
   ${YELLOW}rust-stable-install${RESET} [${DIM}--yes${RESET}] [${DIM}--self-test${RESET}] [${DIM}--check${RESET}] [${DIM}--no-color${RESET}] [${DIM}--rm${RESET}|${DIM}--trash${RESET}] [${DIM}-h${RESET}|${DIM}--help${RESET}]
 
 ${BOLD}OPTIONS${RESET}
-  ${BOLD}${BLUE}--yes${RESET}         ${DIM}Non-interactive: auto-continue prompts.${RESET}
-  ${BOLD}${BLUE}--self-test${RESET}   ${DIM}Non-destructive checks only: tools, platform, manifest parse, permissions.${RESET}
-  ${BOLD}${BLUE}--check${RESET}       ${DIM}Check only: compare installed version.txt with latest stable (no install).${RESET}
-  ${BOLD}${BLUE}--no-color${RESET}    ${DIM}Disable ANSI colors (same effect as NO_COLOR=1).${RESET}
-  ${BOLD}${BLUE}--rm${RESET}          ${DIM}Use rm for deletions (permanent).${RESET}
-  ${BOLD}${BLUE}--trash${RESET}       ${DIM}Use trash-cli for deletions (recoverable; default).${RESET}
-  ${BOLD}${BLUE}-h${RESET}, ${BOLD}${BLUE}--help${RESET}    ${DIM}Show this help.${RESET}
+  ${YELLOW}rust-stable-install ${RESET}              ${DIM}Check + install latest Rust stable if newer${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}--yes${RESET}         ${DIM}Non-interactive: auto-continue prompts.${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}--self-test${RESET}   ${DIM}Non-destructive checks only: tools, platform, manifest parse, permissions.${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}--check${RESET}       ${DIM}Check only: compare installed version.txt with latest stable (no install).${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}--no-color${RESET}    ${DIM}Disable ANSI colors (same effect as NO_COLOR=1).${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}--rm${RESET}          ${DIM}Use rm for deletions (permanent).${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}--trash${RESET}       ${DIM}Use trash-cli for deletions (recoverable; default).${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}-h${RESET}, ${BLUE}--help${RESET}    ${DIM}Show this help.${RESET}
 
-${BOLD}What it does:${RESET}
-  • Verifies required tools and platform safety (Linux only)
-  • Detects system architecture and resolves the Rust target triple
-  • Reads the installed Rust version from ${VERSION_FILE} (if present)
-  • Fetches and parses the official Rust stable manifest (in-memory)
-  • Compares installed vs latest stable version
-  • If up-to-date: exits cleanly without changes
-  • If newer:
-      – Cleans the working directory using trash or rm (per flag)
-      – Downloads the correct Rust standalone tarball
-      – Verifies SHA256 integrity
-      – Unpacks deterministically
-      – Installs to the configured prefix using sudo
-  • Writes the new version back to version.txt on success
+${BOLD}WHAT IT DOES${RESET}
+  • Detects your Rust target triple (Linux only)
+  • Reads installed version from ${VERSION_FILE} (if present)
+  • Fetches Rust stable manifest and compares versions
+  • If newer: downloads tarball, verifies SHA256, unpacks, installs to prefix
+
+${BOLD}REQUIREMENTS${RESET}
+  bash, awk, sed, grep, tar, sha256sum, wget2|curl|wget, trash|rm, sudo
 
 ${BOLD}ENV${RESET}
-  ${BOLD}${BLUE}NO_COLOR${RESET}=${BOLD}${BLUE}1${RESET}    ${DIM}Disable ANSI colors.${RESET}
+  ${BLUE}NO_COLOR${RESET}=${BLUE}1${RESET}    ${DIM}Disable ANSI colors.${RESET}
 
+${BOLD}SOURCE${RESET}
+  ${CYAN}https://static.rust-lang.org/${RESET}
 EOF
 }
 
