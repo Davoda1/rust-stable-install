@@ -159,6 +159,12 @@ WORKDIR=/tmp/rust-installer INSTALL_PREFIX=$HOME/.local/rust-stable ./rust-stabl
 ./rust-stable-install --self-test
 ```
 
+### Check for update
+
+```bash
+./rust-stable-install --check
+```
+
 ### Disable colors
 
 ```bash
