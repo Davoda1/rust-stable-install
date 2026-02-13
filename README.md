@@ -195,6 +195,14 @@ Force trash explicitly:
 
 The script always prints whether it is **trashing** or **deleting** files.
 
+Disable trash/rm or `$INSTALL_PREFIX` folder:
+
+```bash
+./rust-stable-install --no-delete
+```
+
+This will just skip the parts in `Step 11`; has no change on `$WORKDIR`
+
 ## Safety and scope
 
 The script **only modifies**:
