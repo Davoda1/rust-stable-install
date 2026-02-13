@@ -60,6 +60,7 @@ ASSUME_YES=0
 SELF_TEST=0
 FORCE_NO_COLOR=0
 SKIP_PREFIX_DELETE=0
+USER_REQ_NO_DEL=0
 CHECK_ONLY=0
 DELETE_BACKEND="trash"
 PRINT_HELP_VAR=0
@@ -69,7 +70,7 @@ print_help() {
 ${BOLD}rust-stable-install${RESET} — ${DIM}Rust stable standalone installer wrapper${RESET}
 
 ${BOLD}USAGE${RESET}
-  ${YELLOW}rust-stable-install${RESET} [${DIM}--yes${RESET}] [${DIM}--self-test${RESET}] [${DIM}--check${RESET}] [${DIM}--no-color${RESET}] [${DIM}--rm${RESET}|${DIM}--trash${RESET}] [${DIM}-h${RESET}|${DIM}--help${RESET}]
+  ${YELLOW}rust-stable-install${RESET} [${DIM}--yes${RESET}] [${DIM}--self-test${RESET}] [${DIM}--check${RESET}] [${DIM}--no-color${RESET}] [${DIM}--rm${RESET}|${DIM}--trash${RESET}] [${DIM}--no-delete${RESET}] [${DIM}-h${RESET}|${DIM}--help${RESET}]
 
 ${BOLD}OPTIONS${RESET}
   ${YELLOW}rust-stable-install ${RESET}              ${DIM}Check + install latest Rust stable if newer${RESET}
@@ -79,6 +80,7 @@ ${BOLD}OPTIONS${RESET}
   ${YELLOW}rust-stable-install ${RESET}${BLUE}--no-color${RESET}    ${DIM}Disable ANSI colors (same effect as NO_COLOR=1).${RESET}
   ${YELLOW}rust-stable-install ${RESET}${BLUE}--rm${RESET}          ${DIM}Use rm for deletions (permanent).${RESET}
   ${YELLOW}rust-stable-install ${RESET}${BLUE}--trash${RESET}       ${DIM}Use trash-cli for deletions (recoverable; default).${RESET}
+  ${YELLOW}rust-stable-install ${RESET}${BLUE}--no-delete${RESET}   ${DIM}Do NOT delete \$INSTALL_PREFIX before install (in-place install).${RESET}
   ${YELLOW}rust-stable-install ${RESET}${BLUE}-h${RESET}, ${BLUE}--help${RESET}    ${DIM}Show this help.${RESET}
 
 ${BOLD}WHAT IT DOES${RESET}
@@ -107,6 +109,7 @@ while (( $# > 0 )); do
         --no-color) FORCE_NO_COLOR=1; shift ;;
         --rm) DELETE_BACKEND="rm"; shift ;;
         --trash) DELETE_BACKEND="trash"; shift ;;
+        --no-delete) SKIP_PREFIX_DELETE=1; USER_REQ_NO_DEL=1; shift ;;
         -h|--help) PRINT_HELP_VAR=1; shift ;;
         *)
             echo "Unknown argument: $1" >&2
@@ -165,10 +168,32 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required tool: '$1'
 
 prompt_yes_no() {
     local prompt="$1"
+
     if [[ "$ASSUME_YES" == "1" ]]; then
         info "${prompt} (auto-yes)"
         return 0
     fi
+
+    # Enterless only when we have a real terminal to read from.
+    # Use /dev/tty so piping the script doesn't break prompts.
+    if [[ -t 0 || -t 1 || -t 2 ]] && [[ -r /dev/tty ]]; then
+        local key=""
+        # Print prompt without newline; show explicit choices.
+        printf "%s%s%s " "${BOLD}${YELLOW}" "${prompt}" "${RESET}" > /dev/tty
+
+        # Read exactly 1 char, no echo.
+        # If user hits Ctrl-C, script will terminate as usual.
+        IFS= read -r -n 1 -s key < /dev/tty || true
+        printf "\n" > /dev/tty
+
+        case "${key}" in
+            y|Y) return 0 ;;
+            n|N|'') return 1 ;;   # Enter => default No
+            *) return 1 ;;
+        esac
+    fi
+
+    # Fallback for non-interactive contexts (cron, redirected stdin, etc.)
     local ans=""
     printf "%s%s%s " "${BOLD}${YELLOW}" "${prompt}" "${RESET}"
     read -r ans || true
@@ -177,7 +202,6 @@ prompt_yes_no() {
         *)     return 1 ;;
     esac
 }
-
 
 # ----------------------------- Delete backend helpers -----------------------------
 DEL_NOUN="Trash"
@@ -369,6 +393,34 @@ download_into_dir_keep_name() {
     [[ -n "$filename" ]] || die "Could not derive filename from URL: $url"
     download_to "$url" "${dir}/${filename}"
     printf "%s" "${dir}/${filename}"
+}
+
+# Progress indicator for tar that's not spammy
+run_with_spinner() {
+    # Usage: run_with_spinner "Label..." -- command arg...
+    local label="$1"; shift
+    local pid spin='-\|/' i=0
+
+    info "$label"
+    if ! is_tty; then
+        "$@" || return 1
+        return 0
+    fi
+
+    # Run command in background (silence stdout; keep stderr)
+    ( "$@" >/dev/null ) &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%s[%s]%s %s %c" "${BOLD}${CYAN}" "...." "${RESET}" "$label" "${spin:i%4:1}"
+        i=$((i+1))
+        sleep 0.1
+    done
+
+    wait "$pid"
+    local rc=$?
+    printf "\r%s[%s]%s %s ✓\n" "${BOLD}${GREEN}" " OK " "${RESET}" "$label"
+    return "$rc"
 }
 
 # ----------------------------- Manifest parsing (Step 4) -----------------------------
@@ -685,8 +737,10 @@ Refusing to unpack/install."
     fi
     ok "SHA256 OK."
 
-    info "Step 10: Unpack with tar -xvJf"
-    ( cd "$WORKDIR" && tar -xvJf "$tar_file" ) || die "Unpack failed."
+    info "Step 10: Unpack with tar -xJf"
+#   ( cd "$WORKDIR" && tar -xJf "$tar_file" ) || die "Unpack failed."
+    run_with_spinner "Step 10: Unpacking tarball" bash -c 'cd "$1" && tar -xJf "$2"' _ "$WORKDIR" "$tar_file" \
+    || die "Unpack failed."
 
     info "Step 10b: Determine unpack directory from tar listing (deterministic)"
     local topdir
@@ -696,23 +750,27 @@ Refusing to unpack/install."
     [[ -d "$unpack_dir" ]] || die "Expected unpack directory not found: ${unpack_dir}"
     ok "Unpacked directory: ${unpack_dir}"
 
-    if [[ -e "$INSTALL_PREFIX" ]]; then
-        if [[ ! -w "$INSTALL_PREFIX" ]]; then
-            warn "Install prefix exists but is not writable by user '$USER': $INSTALL_PREFIX"
-            warn "Likely installed with sudo into a root-owned path."
-            warn "I cannot remove it safely."
-            warn "Continuing may fail or may overwrite in-place using sudo and could leave a mixed install."
-            warn "Recommended to abort and remove it manually with sudo if this is intended."
+    # if --no-delete is set by user this is not needed.
+    if [[ "$USER_REQ_NO_DEL" != "1" ]]; then
+        if [[ -e "$INSTALL_PREFIX" ]]; then
+            if [[ ! -w "$INSTALL_PREFIX" ]]; then
+                warn "Install prefix exists but is not writable by user '$USER': $INSTALL_PREFIX"
+                warn "Likely installed with sudo into a root-owned path."
+                warn "I cannot remove it safely."
+                warn "Continuing may fail or may overwrite in-place using sudo and could leave a mixed install."
+                warn "Recommended to abort and remove it manually with sudo if this is intended."
 
-            if ! prompt_yes_no "Continue anyway at your own risk? [y/N]"; then
-                die "Aborted by user due to non-writable install prefix."
+                if ! prompt_yes_no "Continue anyway at your own risk? [y/N]"; then
+                    die "Aborted by user due to non-writable install prefix."
+                fi
+
+                info "Continuing without removing existing install prefix."
+                SKIP_PREFIX_DELETE=1
             fi
-
-            info "Continuing without removing existing install prefix."
-            SKIP_PREFIX_DELETE=1
         fi
     fi
 
+    # If user explicitly requested keeping prefix, we never delete it here.
     if [[ "$SKIP_PREFIX_DELETE" != "1" ]]; then
         info "Step 11: ${DEL_ING} existing install prefix if it exists: ${INSTALL_PREFIX} (${DEL_DESC})"
         if [[ -e "$INSTALL_PREFIX" ]]; then
@@ -726,7 +784,11 @@ Refusing to unpack/install."
             info "No existing install dir to ${DEL_VERB}."
         fi
     else
-        warn "Skipping prefix deletion due to non-writable prefix (user chose to continue)."
+        if [[ "$USER_REQ_NO_DEL" != "1" ]]; then
+            warn "Skipping prefix deletion due to non-writable prefix (user chose to continue)."
+        else
+            info "Step 11: ${INSTALL_PREFIX} will not be ${DEL_PAST} due to set '--no-delete' flag."
+        fi
     fi
 
     info "Step 12: Install (sudo required per your command)"
