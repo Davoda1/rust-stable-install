@@ -90,7 +90,7 @@ ${BOLD}WHAT IT DOES${RESET}
   • If newer: downloads tarball, verifies SHA256, unpacks, installs to prefix
 
 ${BOLD}REQUIREMENTS${RESET}
-  bash, awk, sed, grep, tar, sha256sum, wget2|curl|wget, trash|rm, sudo
+  bash, awk, sed, grep, tar (±xz), sha256sum, wget2|curl|wget, trash|rm, sudo
 
 ${BOLD}ENV${RESET}
   ${BLUE}NO_COLOR${RESET}=${BLUE}1${RESET}    ${DIM}Disable ANSI colors.${RESET}
@@ -303,19 +303,79 @@ tool_checks() {
     ok "Tool checks passed. Downloader selected: ${DL_BIN}"
 }
 
+# ----------------------------- Tar helpers (Step 10) -----------------------------
+tar_supports_J() {
+    tar --help 2>/dev/null | grep -qE '(^|[[:space:]])-J([[:space:]]|,|$)'
+}
+
+tar_list() {
+    # Usage: tar_list <tarball_path>
+    local tarball="$1"
+    if tar_supports_J; then
+        tar -tJf "$tarball"
+    else
+        # xz fallback
+        xz -dc -- "$tarball" | tar -tf -
+    fi
+}
+
+tar_extract() {
+    # Usage: tar_extract <tarball_path> <dest_dir>
+    local tarball="$1"
+    local dest="$2"
+    if tar_supports_J; then
+        ( cd "$dest" && tar -xJf "$tarball" )
+    else
+        ( cd "$dest" && xz -dc -- "$tarball" | tar -xf - )
+    fi
+}
+
 # ----------------------------- Platform + arch mapping (Step 5) -----------------------------
+detect_libc() {
+    # musl detection for Alpine-style systems; otherwise assume glibc
+    if command -v ldd >/dev/null 2>&1; then
+        if ldd --version 2>&1 | grep -qi musl; then
+            echo "musl"
+            return
+        fi
+        # Busybox ldd might not support --version; try a direct string scan
+        if ldd 2>&1 | grep -qi musl; then
+            echo "musl"
+            return
+        fi
+    fi
+    # fallback: look for musl loader files
+    if ls /lib/ld-musl-*.so.1 >/dev/null 2>&1 || ls /usr/lib/ld-musl-*.so.1 >/dev/null 2>&1; then
+        echo "musl"
+    else
+        echo "gnu"
+    fi
+}
+
 get_rust_target_triple() {
-    local os arch
+    local os arch libc
     os="$(uname -s || true)"
     arch="$(uname -m || true)"
-
     [[ "$os" == "Linux" ]] || die "This script supports Linux only. Detected OS: '${os}'."
 
+    libc="$(detect_libc)"
+
     case "$arch" in
-        x86_64)  printf "x86_64-unknown-linux-gnu" ;;
-        aarch64) printf "aarch64-unknown-linux-gnu" ;;
-        i686)    printf "i686-unknown-linux-gnu" ;;
-        armv7l)  printf "armv7-unknown-linux-gnueabihf" ;;
+        x86_64)  printf "x86_64-unknown-linux-%s" "$libc" ;;
+        aarch64) printf "aarch64-unknown-linux-%s" "$libc" ;;
+        i686)
+            # i686 musl target exists in Rust, but verify via manifest later
+            printf "i686-unknown-linux-%s" "$libc"
+            ;;
+        armv7l)
+            # NOTE: Rust uses gnueabihf for gnu. musl target naming differs.
+            # Keep your current known-good mapping for gnu; for musl, let manifest validation fail clearly.
+            if [[ "$libc" == "gnu" ]]; then
+                printf "armv7-unknown-linux-gnueabihf"
+            else
+                printf "armv7-unknown-linux-musleabihf"
+            fi
+            ;;
         *)
             die "Unsupported architecture '${arch}'. No known Rust standalone installer triple mapping."
             ;;
@@ -341,17 +401,6 @@ fetch_stdout() {
         *)     die "Internal error: unknown downloader '${DL_BIN}'." ;;
     esac
 }
-
-# download_to() {
-#     local url="$1"
-#     local out="$2"
-#     case "$DL_BIN" in
-#         wget2) wget2 -q --https-only -O "$out" "$url" ;;
-#         curl)  curl -fsSL -o "$out" "$url" ;;
-#         wget)  wget -q --https-only -O "$out" "$url" ;;
-#         *)     die "Internal error: unknown downloader '${DL_BIN}'." ;;
-#     esac
-# }
 
 download_to() {
     local url="$1"
@@ -507,45 +556,150 @@ parse_stable_version_only() {
 
 
 # ----------------------------- Self-test (non-destructive) -----------------------------
+SELFTEST_FAILS=0
+st_err()  { err "$*"; SELFTEST_FAILS=$((SELFTEST_FAILS+1)); }
+st_warn() { warn "$*"; }
+st_ok()   { ok "$*"; }
+st_need_cmd() {
+    local c="$1"
+    if command -v "$c" >/dev/null 2>&1; then
+        st_ok "Found tool: $c"
+        return 0
+    fi
+    st_err "Missing required tool: '$c'"
+    return 1
+}
+
+tool_checks_selftest() {
+    info "Self-test: required tools"
+
+    # Basic env sanity (do not die)
+    [[ -n "${USER:-}" ]] || st_err "\$USER is empty/unset."
+    [[ -n "${HOME:-}" ]] || st_err "\$HOME is empty/unset."
+
+    st_need_cmd bash
+    st_need_cmd uname
+    st_need_cmd id
+    st_need_cmd mkdir
+    st_need_cmd cat
+    st_need_cmd printf
+    st_need_cmd grep
+    st_need_cmd sed
+    st_need_cmd awk
+    st_need_cmd tar
+    st_need_cmd sha256sum
+    st_need_cmd head
+    st_need_cmd cut
+    st_need_cmd sudo
+
+    if [[ "$DELETE_BACKEND" == "trash" ]]; then
+        st_need_cmd trash
+        st_need_cmd trash-empty
+    else
+        st_need_cmd rm
+    fi
+
+    # tar/xz capability (only requires xz if no -J)
+    if tar_supports_J; then
+        st_ok "tar supports -J (xz not required)"
+    else
+        st_warn "tar does NOT advertise -J; will require xz fallback"
+        st_need_cmd xz
+    fi
+
+    # downloader selection (do not die)
+    if command -v wget2 >/dev/null 2>&1; then
+        DL_BIN="wget2"
+        st_ok "Downloader selected: wget2"
+    elif command -v curl >/dev/null 2>&1; then
+        DL_BIN="curl"
+        st_ok "Downloader selected: curl"
+    elif command -v wget >/dev/null 2>&1; then
+        DL_BIN="wget"
+        st_ok "Downloader selected: wget"
+    else
+        st_err "Missing downloader: install 'wget2' (preferred) or 'curl' or 'wget'."
+    fi
+}
+
 self_test() {
-    tool_checks
+    SELFTEST_FAILS=0
+
+    tool_checks_selftest
 
     info "Self-test: platform/arch"
-    local triple
-    triple="$(get_rust_target_triple)"
-    info "Detected target: ${triple}"
-    ok "Target triple: ${triple}"
+    local triple=""
+    if triple="$(get_rust_target_triple)"; then
+        info "Detected target: ${triple}"
+        st_ok "Target triple: ${triple}"
+    else
+        # get_rust_target_triple uses die; if OS is wrong it will exit.
+        # If you truly want self-test to never exit, you must also soften get_rust_target_triple.
+        st_err "Failed to detect target triple."
+        triple=""
+    fi
 
     info "Self-test: workdir permissions (non-destructive)"
     if [[ -d "$WORKDIR" ]]; then
-        [[ -r "$WORKDIR" && -w "$WORKDIR" ]] || die "Workdir exists but is not readable/writable: ${WORKDIR}"
-        ok "Workdir exists and is RW: ${WORKDIR}"
+        if [[ -r "$WORKDIR" && -w "$WORKDIR" ]]; then
+            st_ok "Workdir exists and is RW: ${WORKDIR}"
+        else
+            st_err "Workdir exists but is not readable/writable: ${WORKDIR}"
+        fi
     else
-        die "Workdir missing: ${WORKDIR} (would be created in normal run)."
+        st_warn "Workdir missing: ${WORKDIR} (would be created in normal run)."
+        local parent
+        parent="$(dirname "$WORKDIR")"
+        if [[ -d "$parent" && -w "$parent" ]]; then
+            st_ok "Parent dir is writable; workdir creation should succeed: ${parent}"
+        else
+            st_err "Parent dir not writable; normal run would likely fail. Parent: ${parent}"
+        fi
     fi
 
     info "Self-test: manifest fetch + parse"
-    local manifest
-    manifest="$(fetch_stdout "$MANIFEST_URL")" || die "Failed to fetch manifest: ${MANIFEST_URL}"
+    if [[ -z "${DL_BIN:-}" ]]; then
+        st_err "No downloader selected; cannot fetch manifest."
+    else
+        local manifest=""
+        if manifest="$(fetch_stdout "$MANIFEST_URL" 2>/dev/null)"; then
+            st_ok "Fetched manifest: ${MANIFEST_URL}"
+        else
+            st_err "Failed to fetch manifest: ${MANIFEST_URL}"
+            manifest=""
+        fi
 
-    local ver url hash
-    mapfile -t lines < <(parse_manifest_from_text "$manifest" "$triple")
-    ver="${lines[0]:-}"; url="${lines[1]:-}"; hash="${lines[2]:-}"
+        if [[ -n "$manifest" && -n "$triple" ]]; then
+            local ver url hash
+            mapfile -t lines < <(parse_manifest_from_text "$manifest" "$triple")
+            ver="${lines[0]:-}"; url="${lines[1]:-}"; hash="${lines[2]:-}"
 
-    [[ -n "$ver" ]] || die "Manifest parse failed: version missing."
-    [[ -n "$url" ]] || die "Manifest parse failed: url missing for ${triple}."
-    [[ -n "$hash" ]] || die "Manifest parse failed: hash missing for ${triple}."
-    ok "Parsed stable version: ${ver}"
-    ok "Parsed URL: ${url}"
-    ok "Parsed SHA256: ${hash}"
+            [[ -n "$ver"  ]] || st_err "Manifest parse failed: version missing."
+            [[ -n "$url"  ]] || st_err "Manifest parse failed: url missing for ${triple}."
+            [[ -n "$hash" ]] || st_err "Manifest parse failed: hash missing for ${triple}."
 
-    # Validate URL matches triple (future-proof sanity)
-    if [[ "$url" != *"$triple"* ]]; then
-        die "Parsed URL does not contain target triple '${triple}'. Refusing (sanity check). URL: ${url}"
+            if [[ -n "$ver" ]]; then st_ok "Parsed stable version: ${ver}"; fi
+            if [[ -n "$url" ]]; then st_ok "Parsed URL: ${url}"; fi
+            if [[ -n "$hash" ]]; then st_ok "Parsed SHA256: ${hash}"; fi
+
+            if [[ -n "$url" && "$url" != *"$triple"* ]]; then
+                st_err "URL sanity check failed: URL does not contain target triple '${triple}'."
+            elif [[ -n "$url" ]]; then
+                st_ok "URL sanity check passed (contains target triple)."
+            fi
+        else
+            [[ -n "$triple" ]] || st_err "Skipping manifest parse (no triple)."
+            [[ -n "$manifest" ]] || st_err "Skipping manifest parse (no manifest)."
+        fi
     fi
-    ok "URL sanity check passed (contains target triple)."
 
-    ok "Self-test OK (no changes made)."
+    if (( SELFTEST_FAILS == 0 )); then
+        ok "Self-test OK (no changes made)."
+        return 0
+    fi
+
+    warn "Self-test completed with ${SELFTEST_FAILS} error(s). No changes made."
+    return 0
 }
 
 # ----------------------------- Main -----------------------------
@@ -738,13 +892,12 @@ Refusing to unpack/install."
     ok "SHA256 OK."
 
     info "Step 10: Unpack with tar -xJf"
-#   ( cd "$WORKDIR" && tar -xJf "$tar_file" ) || die "Unpack failed."
-    run_with_spinner "Step 10: Unpacking tarball" bash -c 'cd "$1" && tar -xJf "$2"' _ "$WORKDIR" "$tar_file" \
+    run_with_spinner "Step 10: Unpacking tarball" tar_extract "$tar_path" "$WORKDIR" \
     || die "Unpack failed."
 
     info "Step 10b: Determine unpack directory from tar listing (deterministic)"
     local topdir
-    topdir="$(tar -tJf "$tar_path" | sed -n '1{s#/.*##;p;}')"   # no early pipe close => no SIGPIPE
+    topdir="$(tar_list "$tar_path" | sed -n '1{s#/.*##;p;}')"   # no early pipe close => no SIGPIPE
     [[ -n "$topdir" ]] || die "Could not determine top-level directory from tarball."
     local unpack_dir="${WORKDIR}/${topdir}"
     [[ -d "$unpack_dir" ]] || die "Expected unpack directory not found: ${unpack_dir}"
