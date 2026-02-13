@@ -339,8 +339,12 @@ detect_libc() {
             return
         fi
         # Busybox ldd might not support --version; try a direct string scan
-        if ldd 2>&1 | grep -qi musl; then
+        if ldd --version 2>&1 | grep -qi musl; then
             echo "musl"
+            return
+        fi
+        if ldd --version 2>&1 | grep -qi GLIBC; then
+            echo "gnu"
             return
         fi
     fi
